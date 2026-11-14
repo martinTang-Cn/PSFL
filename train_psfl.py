@@ -1,5 +1,7 @@
 """Single-device prototype-guided split federated patch classification."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 from dataclasses import dataclass, field
@@ -18,28 +20,7 @@ from model.patch_classifier import PatchClassifier, build_encoders
 ROOT = Path(__file__).resolve().parent
 
 
-def paired_windows(contacts):
-    """Merge overlapping direct contacts for the two satellites in each plane."""
-    windows = []
-    for plane in sorted({row["plane"] for row in contacts}):
-        current = None
-        rows = sorted((r for r in contacts if r["plane"] == plane), key=lambda r: r["start_offset_s"])
-        for row in rows:
-            if current is None or row["start_offset_s"] > current["end_offset_s"]:
-                current = {key: row[key] for key in (
-                    "plane", "start_offset_s", "end_offset_s", "start_utc", "end_utc",
-                    "min_slant_range_km", "uplink_mbps", "downlink_mbps",
-                )}
-                current["direct_satellites"] = row["satellite_id"]
-                windows.append(current)
-            else:
-                if row["end_offset_s"] > current["end_offset_s"]:
-                    current["end_offset_s"] = row["end_offset_s"]
-                    current["end_utc"] = row["end_utc"]
-                current["min_slant_range_km"] = min(current["min_slant_range_km"], row["min_slant_range_km"])
-                direct = set(current["direct_satellites"].split(";"))
-                current["direct_satellites"] = ";".join(sorted(direct | {row["satellite_id"]}))
-    return sorted(windows, key=lambda r: (r["start_offset_s"], r["plane"]))
+MODALITIES = ("radar", "optical")
 
 
 def snapshot(modules):
@@ -91,95 +72,110 @@ def prototype_loss(tokens, labels, centers, temperature):
 
 
 @dataclass
-class Pair:
+class Satellite:
     states: list
     batches: object
     clock: float = 0.0
     version: int = 0
     prototypes: torch.Tensor | None = None
-    packets: list = field(default_factory=list)
+    packets: dict = field(default_factory=dict)
 
 
-def batches(dataset, indices, batch_size, epochs, seed):
+def batches(dataset, indices, batch_size, epochs, seed, modality):
+    """Carry stable dataset indices through each epoch's shuffled batches."""
     rng = torch.Generator().manual_seed(seed)
+    batch_id = 0
     for _ in range(epochs):
         order = indices[torch.randperm(len(indices), generator=rng)]
         for group in order.split(batch_size):
             optical, radar, labels = zip(*(dataset[i] for i in group.tolist()))
-            yield torch.stack(radar), torch.stack(optical), torch.stack(labels)
+            yield batch_id, group.tolist(), torch.stack(radar if modality == "radar" else optical), torch.stack(labels)
+            batch_id += 1
 
 
-def offline(pair, plane, stop, workers, bias, training, version, device, log):
-    step = max(training["radar_local_compute_s"], training["optical_local_compute_s"])
-    if pair.clock + step > stop:
+def offline(sat, plane, modality, stop, workers, bias, training, device, log):
+    step = training[f"{modality}_local_compute_s"]
+    if sat.clock + step > stop:
         return
-    restore(workers, pair.states)
+    restore(workers, sat.states)
+    encoder, head = workers
     mode = training["satellite_encoder_training_mode"]
-    for encoder in workers[:2]:
-        encoder.requires_grad_(mode == "full")
-        if mode == "staged" and version >= training["pretrained_encoder_warmup_aggregations"]:
-            count = training["pretrained_encoder_trainable_blocks"]
-            if count > 0:
-                for block in encoder.transformer.layers[-count:]:
-                    block.requires_grad_(True)
-    opts = [
-        torch.optim.AdamW([
-            {"params": enc.parameters(), "lr": training["encoder_learning_rate"]},
-            {"params": head.parameters(), "lr": training["auxiliary_learning_rate"]},
-        ], weight_decay=training.get("weight_decay", 0.01))
-        for enc, head in zip(workers[:2], workers[2:])
-    ]
-    centers = pair.prototypes.to(device) if pair.prototypes is not None else None
+    encoder.requires_grad_(mode == "full")
+    if mode == "staged" and sat.version >= training["pretrained_encoder_warmup_aggregations"]:
+        count = training["pretrained_encoder_trainable_blocks"]
+        if count > 0:
+            for block in encoder.transformer.layers[-count:]:
+                block.requires_grad_(True)
+    opt = torch.optim.AdamW([
+        {"params": encoder.parameters(), "lr": training["encoder_learning_rate"]},
+        {"params": head.parameters(), "lr": training["auxiliary_learning_rate"]},
+    ], weight_decay=training.get("weight_decay", 0.01))
+    centers = sat.prototypes.to(device) if sat.prototypes is not None else None
     for _ in range(training["local_steps_per_disconnection"]):
-        if pair.clock + step > stop:
+        if sat.clock + step > stop:
             break
-        batch = next(pair.batches, None)
+        batch = next(sat.batches, None)
         if batch is None:
             break
-        radar, optical, labels = (value.to(device) for value in batch)
-        row = {"plane": plane, "start_offset_s": pair.clock, "model_version": pair.version}
-        features = []
-        for name, data, encoder, head, opt in zip(
-            ("radar", "optical"), (radar, optical), workers[:2], workers[2:], opts,
-        ):
-            opt.zero_grad(set_to_none=True)
-            tokens = encoder(data, bias, mask_info=None)
-            ce = F.cross_entropy(head(tokens), labels)
-            proto = prototype_loss(tokens, labels, centers, training["prototype_temperature"])
-            (ce + training["prototype_loss_weight"] * proto).backward()
-            opt.step()
-            features.append(tokens.detach().cpu())
-            row[f"{name}_classification_loss"] = ce.item()
-            row[f"{name}_prototype_loss"] = proto.item()
-        pair.packets.append((*features, labels.cpu()))
-        del pair.packets[:-training["recent_smashed_batches"]]
-        pair.clock += step
-        log.append(row)
-    pair.states = snapshot(workers)
+        batch_id, sample_ids, data, labels = batch
+        opt.zero_grad(set_to_none=True)
+        tokens = encoder(data.to(device), bias, mask_info=None)
+        labels_device = labels.to(device)
+        ce = F.cross_entropy(head(tokens), labels_device)
+        proto = prototype_loss(tokens, labels_device, centers, training["prototype_temperature"])
+        (ce + training["prototype_loss_weight"] * proto).backward()
+        opt.step()
+        sat.packets[batch_id] = (sample_ids, tokens.detach().cpu(), labels)
+        prune(sat.packets, training["recent_smashed_batches"])
+        log.append({"plane": plane, "modality": modality, "batch_id": batch_id,
+                    "sample_ids": ";".join(map(str, sample_ids)),
+                    "start_offset_s": sat.clock, "model_version": sat.version,
+                    "classification_loss": ce.item(), "prototype_loss": proto.item()})
+        sat.clock += step
+    sat.states = snapshot(workers)
+
+
+def prune(packets, limit):
+    while len(packets) > limit:
+        del packets[next(iter(packets))]
 
 
 def nbytes(t):
     return t.numel() * t.element_size()
 
 
-def transaction(pair, row, bank, config, aggregate, sync):
+def latest_samples(packets):
+    """Keep only the latest observation per ID among this satellite's pending batches."""
+    samples = {}
+    for ids, tokens, labels in packets.values():
+        for sample_id, token, label in zip(ids, tokens, labels):
+            samples.pop(sample_id, None)
+            samples[sample_id] = (token, label)
+    return samples
+
+
+def update_cache(cache, samples, limit):
+    for sample_id, (token, label) in samples.items():
+        # Refresh replacement order, and avoid retaining the entire batch storage.
+        cache.pop(sample_id, None)
+        cache[sample_id] = (token.clone(), label.clone())
+    prune(cache, limit)
+
+
+def transaction(sat, row, bank, config, aggregate, sync, samples, matched_batches):
     training, link = config["training"], config["link"]
-    model_sizes = [sum(nbytes(t) for t in state.values()) for state in pair.states]
-    sizes = [model_sizes[i] + model_sizes[i + 2] + link["protocol_overhead_bytes"] for i in range(2)]
+    size = sum(nbytes(t) for state in sat.states for t in state.values()) + link["protocol_overhead_bytes"]
     proto = nbytes(bank.centers) if bank else 0
-    up = [0, 0] if sync else [
-        sizes[i] + sum(nbytes(p[i]) + (nbytes(p[2]) if i == 0 else 0) for p in pair.packets)
-        for i in range(2)
-    ]
-    down = [size + proto for size in sizes]
-    combine = max if training["paired_uplink_mode"] == "parallel_full_rate" else sum
-    duration = combine(up) * 8 / (row["uplink_mbps"] * 1e6)
-    duration += combine(down) * 8 / (row["downlink_mbps"] * 1e6)
+    # Include one 64-bit sample ID per uploaded feature.
+    up = 0 if sync else size + sum(nbytes(x) + nbytes(y) + 8 for x, y in samples.values())
+    down = size + proto
+    duration = up * 8 / (row["uplink_mbps"] * 1e6)
+    duration += down * 8 / (row["downlink_mbps"] * 1e6)
     duration += 2 * row["min_slant_range_km"] / SPEED_OF_LIGHT_KM_S
     if not sync:
-        duration += len(pair.packets) * training["server_compute_s_per_batch"]
+        duration += matched_batches * training["server_compute_s_per_batch"]
         duration += training["aggregation_compute_s"] if aggregate else 0
-    return duration, up, proto
+    return duration, up, down, proto
 
 
 @torch.no_grad()
@@ -212,8 +208,10 @@ def run(config, train, test, windows, out):
     t = config["training"]
     torch.manual_seed(t["seed"])
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if t["device"] == "auto" else t["device"])
-    if min(t["batch_size"], t["epochs"], t["recent_smashed_batches"]) < 1:
-        raise ValueError("batch_size, epochs and recent_smashed_batches must be positive")
+    cache_limit = t.get("server_feature_cache_samples",
+                        t.get("server_feature_cache_batches", t["recent_smashed_batches"]) * t["batch_size"])
+    if min(t["batch_size"], t["epochs"], t["recent_smashed_batches"], cache_limit) < 1:
+        raise ValueError("Batch size, epochs and feature cache limits must be positive")
     if not (t["prototype_temperature"] > 0 and t["prototype_loss_weight"] >= 0 and 0 <= t["prototype_momentum"] < 1):
         raise ValueError("Invalid prototype temperature, weight or momentum")
     if t["satellite_encoder_training_mode"] not in {"full", "frozen", "staged"}:
@@ -231,38 +229,58 @@ def run(config, train, test, windows, out):
     opt = torch.optim.AdamW([*cross.parameters(), *ground.parameters()], lr=t["server_learning_rate"])
     bank = PrototypeBank(classes, dim, device, t["prototype_momentum"]) if t["prototype_learning_enabled"] else None
     global_states = snapshot(workers)
+    by_modality = {m: [workers[i], workers[i + 2]] for i, m in enumerate(MODALITIES)}
+    global_models = {m: [global_states[i], global_states[i + 2]] for i, m in enumerate(MODALITIES)}
     planes = list(range(1, config["constellation"]["planes"] + 1))
     if not windows or not 1 <= t["aggregation_k"] <= len(planes):
         raise ValueError("Need contact windows and a valid aggregation_k")
     partitions = torch.randperm(len(train), generator=torch.Generator().manual_seed(t["seed"])).tensor_split(len(planes))
-    pairs = {
-        plane: Pair(global_states, batches(train, ids, t["batch_size"], t["epochs"], t["seed"] + plane))
+    satellites = {
+        (plane, m): Satellite(global_models[m], batches(train, ids, t["batch_size"], t["epochs"], t["seed"] + plane, m))
         for plane, ids in zip(planes, partitions)
+        for m in MODALITIES
     }
     loader = torch.utils.data.DataLoader(test, batch_size=t["batch_size"])
     local_log, contact_log = [], []
-    pending = {}
-    version, available = 0, 0.0
-    for row in windows:
+    pending = {m: {} for m in MODALITIES}
+    versions = dict.fromkeys(MODALITIES, 0)
+    received = {key: {} for key in satellites}
+    available = 0.0
+    for row in sorted(windows, key=lambda r: (r["start_offset_s"], r["plane"], r["slot"])):
         plane = row["plane"]
-        pair = pairs[plane]
-        offline(pair, plane, row["start_offset_s"], workers, bias, t, version, device, local_log)
-        sync = version - pair.version > t["max_global_version_lag"]
-        aggregate = len(pending.keys() | {plane}) >= t["aggregation_k"]
-        duration, up, proto_bytes = transaction(pair, row, bank, config, aggregate, sync)
+        modality = MODALITIES[row["slot"] - 1]
+        other = MODALITIES[1 - MODALITIES.index(modality)]
+        sat = satellites[plane, modality]
+        own_cache, peer_cache = received[plane, modality], received[plane, other]
+        offline(sat, plane, modality, row["start_offset_s"], by_modality[modality], bias, t, device, local_log)
+        sync = versions[modality] - sat.version > t["max_global_version_lag"]
+        samples = latest_samples(sat.packets) if not sync else {}
+        matched = [sample_id for sample_id in samples if sample_id in peer_cache]
+        matched_batches = (len(matched) + t["batch_size"] - 1) // t["batch_size"]
+        aggregate = len(pending[modality].keys() | {plane}) >= t["aggregation_k"] and not sync
+        duration, up, down, proto_bytes = transaction(
+            sat, row, bank, config, aggregate, sync, samples, matched_batches,
+        )
         start = max(available, row["start_offset_s"])
         finish = start + duration
         losses, accuracy, miou = [], "", ""
         status = "completed"
-        if not pair.packets and not sync:
-            status = "no_matched_features"
+        if not sat.packets and not sync:
+            status = "no_local_features"
         elif finish > row["end_offset_s"] - config["link"]["safety_margin_s"]:
             status = "transaction_does_not_fit_contact"
         else:
             if sync:
                 status = "model_synced"
             else:
-                for radar_tokens, optical_tokens, labels in pair.packets:
+                for start_idx in range(0, len(matched), t["batch_size"]):
+                    ids = matched[start_idx:start_idx + t["batch_size"]]
+                    local, peer = zip(*((samples[i], peer_cache[i]) for i in ids))
+                    radar, optical = (local, peer) if modality == "radar" else (peer, local)
+                    radar_tokens, labels = map(torch.stack, zip(*radar))
+                    optical_tokens, optical_labels = map(torch.stack, zip(*optical))
+                    if not torch.equal(labels, optical_labels):
+                        raise RuntimeError(f"Misaligned labels for plane {plane}, samples {ids}")
                     opt.zero_grad(set_to_none=True)
                     fused = cross(radar_tokens.to(device), optical_tokens.to(device), bias)
                     labels = labels.to(device)
@@ -272,48 +290,62 @@ def run(config, train, test, windows, out):
                     if bank:
                         bank.update(fused, labels)
                     losses.append(loss.item())
-                pending[plane] = pair.states
+                update_cache(own_cache, samples, cache_limit)
+                if not matched:
+                    status = "uploaded_waiting_for_peer"
+                pending[modality][plane] = sat.states
                 if aggregate:
-                    global_states = average(pending.values())
-                    pending.clear()
-                    version += 1
-                    restore(workers, global_states)
+                    global_models[modality] = average(pending[modality].values())
+                    pending[modality].clear()
+                    versions[modality] += 1
+                    for m in MODALITIES:
+                        restore(by_modality[m], global_models[m])
                     accuracy, miou = evaluate(loader, workers, cross, ground, bias, device, classes)
-                    print(f"[aggregation {version}] end_s={row['end_offset_s']:.1f} "
-                          f"server_mean_loss={sum(losses)/len(losses):.4f} "
+                    mean_loss = f"{sum(losses)/len(losses):.4f}" if losses else "n/a"
+                    print(f"[aggregation {modality}:{versions[modality]}] end_s={row['end_offset_s']:.1f} "
+                          f"server_mean_loss={mean_loss} "
                           f"test_accuracy={accuracy:.4f} test_miou={miou:.4f}", flush=True)
-            pair.states = global_states
-            pair.version = version
-            pair.prototypes = bank.centers.detach().cpu().clone() if bank else None
-            pair.packets.clear()
+            sat.states = global_models[modality]
+            sat.version = versions[modality]
+            sat.prototypes = bank.centers.detach().cpu().clone() if bank else None
+            sat.packets.clear()
             available = finish
-        pair.clock = max(pair.clock, row["end_offset_s"])
-        sent = status in {"completed", "model_synced"}
+        sat.clock = max(sat.clock, row["end_offset_s"])
+        sent = status in {"completed", "model_synced", "uploaded_waiting_for_peer"}
         contact_log.append({
             "plane": plane, "contact_start_s": row["start_offset_s"], "contact_end_s": row["end_offset_s"],
+            "satellite_id": row["satellite_id"], "modality": modality,
             "status": status, "transaction_finish_s": finish if sent else "",
-            "radar_upload_bytes": up[0] if sent else 0, "optical_upload_bytes": up[1] if sent else 0,
+            "radar_upload_bytes": up if sent and modality == "radar" else 0,
+            "optical_upload_bytes": up if sent and modality == "optical" else 0,
+            "download_bytes": down if sent else 0,
             "prototype_downlink_bytes_per_satellite": proto_bytes if sent else 0,
-            "prototype_active_classes": int((pair.prototypes.norm(dim=1) > 1e-6).sum())
-            if sent and pair.prototypes is not None else "",
-            "global_version": version, "server_updates": len(losses),
+            "prototype_active_classes": int((sat.prototypes.norm(dim=1) > 1e-6).sum())
+            if sent and sat.prototypes is not None else "",
+            "global_version": versions[modality], "server_updates": len(losses),
+            "uploaded_samples": len(samples) if sent else 0,
+            "matched_samples": len(matched) if sent else 0,
+            "cached_samples_for_modality": len(own_cache),
             "server_mean_loss": sum(losses) / len(losses) if losses else "",
             "test_accuracy": accuracy, "test_miou": miou,
         })
     horizon = config["simulation"]["duration_hours"] * 3600
-    for plane, pair in pairs.items():
-        offline(pair, plane, horizon, workers, bias, t, version, device, local_log)
-    restore(workers, global_states)
+    for (plane, modality), sat in satellites.items():
+        offline(sat, plane, modality, horizon, by_modality[modality], bias, t, device, local_log)
+    for m in MODALITIES:
+        restore(by_modality[m], global_models[m])
     accuracy, miou = evaluate(loader, workers, cross, ground, bias, device, classes)
     write_csv(out / "local_training_log.csv", sorted(local_log, key=lambda row: row["start_offset_s"]))
     write_csv(out / "training_log.csv", contact_log)
-    summary = {"test_accuracy": accuracy, "test_miou": miou, "aggregations": version,
+    summary = {"test_accuracy": accuracy, "test_miou": miou, "aggregations": sum(versions.values()),
+               "aggregations_by_modality": versions,
                "server_updates": sum(row["server_updates"] for row in contact_log),
                "train_samples": len(train), "test_samples": len(test),
                "samples_per_plane": {p: len(ids) for p, ids in zip(planes, partitions)}}
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     torch.save({
-        "global_states": dict(zip(("radar_encoder", "optical_encoder", "radar_head", "optical_head"), global_states)),
+        "global_states": {f"{m}_{name}": state for m in MODALITIES
+                          for name, state in zip(("encoder", "head"), global_models[m])},
         "cross_encoder_state": snapshot([cross])[0], "ground_head_state": snapshot([ground])[0],
         "prototype_bank": bank.centers.cpu() if bank else None, "config": config,
     }, out / "checkpoint.pt")
@@ -335,11 +367,11 @@ def main():
     if root is not None:
         root = ROOT / Path(root).expanduser()
     train, test = (Houston2013Dataset(dataset["patch_size"], split, root) for split in ("train", "test"))
-    windows = paired_windows(detect_contacts(config, epoch, constellation, station))
+    windows = detect_contacts(config, epoch, constellation, station)
     out = args.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out.mkdir(parents=True)
     (out / "config.json").write_bytes(args.config.read_bytes())
-    write_csv(out / "pair_contact_windows.csv", windows)
+    write_csv(out / "contact_windows.csv", windows)
     run(config, train, test, windows, out)
     print(f"Results: {out}")
 
