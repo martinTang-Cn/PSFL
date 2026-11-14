@@ -1,0 +1,70 @@
+{
+  "simulation": {
+    "epoch_utc": "2026-09-14T00:00:00Z",
+    "duration_hours": 90,
+    "orbit_sample_step_s": 30,
+    "contact_detection_step_s": 5
+  },
+  "constellation": {
+    "walker_type": "delta",
+    "total_satellites": 8,
+    "planes": 4,
+    "phasing_factor": 1,
+    "altitude_km": 550.0,
+    "inclination_deg": 53.0
+  },
+  "ground_station": {
+    "name": "Beijing",
+    "latitude_deg": 39.9042,
+    "longitude_deg": 116.4074,
+    "altitude_m": 50.0,
+    "minimum_elevation_deg": 10.0,
+    "simultaneous_links": 1
+  },
+  "link": {
+    "uplink_mbps": 100.0,
+    "downlink_mbps": 12.0,
+    "protocol_overhead_bytes": 512,
+    "safety_margin_s": 1.0
+  },
+  "dataset": {
+    "patch_size": 9,
+    "root_dir": "datasets/Houston2013"
+  },
+  "croma": {
+    "patch_size": 1,
+    "encoder_dim": 192,
+    "radar_encoder_layers": 3,
+    "optical_encoder_layers": 3,
+    "cross_encoder_layers": 6,
+    "attention_heads": 16,
+    "decoder_dim": 512,
+    "decoder_layers": 1,
+    "pretrained_checkpoint": null
+  },
+  "training": {
+    "seed": 42,
+    "device": "auto",
+    "batch_size": 16,
+    "epochs": 400,
+    "encoder_learning_rate": 0.0001,
+    "auxiliary_learning_rate": 0.0001,
+    "server_learning_rate": 0.00005,
+    "prototype_learning_enabled": true,
+    "prototype_temperature": 0.1,
+    "prototype_loss_weight": 0.5,
+    "prototype_momentum": 0.9,
+    "satellite_encoder_training_mode": "full",
+    "pretrained_encoder_warmup_aggregations": 5,
+    "pretrained_encoder_trainable_blocks": 1,
+    "local_steps_per_disconnection": 20,
+    "recent_smashed_batches": 20,
+    "aggregation_k": 4,
+    "max_global_version_lag": 2,
+    "radar_local_compute_s": 0.5,
+    "optical_local_compute_s": 0.5,
+    "server_compute_s_per_batch": 0.2,
+    "aggregation_compute_s": 0.05,
+    "paired_uplink_mode": "parallel_full_rate"
+  }
+}

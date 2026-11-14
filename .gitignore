@@ -1,0 +1,21 @@
+# Local datasets
+/datasets/Houston2013/
+/datasets/*.zip
+
+# Training and orbit-generation outputs
+/runs/
+/outputs/
+/constellation_generation/outputs/
+*.pt
+*.pth
+*.ckpt
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local editor settings
+.idea/
+.vscode/
