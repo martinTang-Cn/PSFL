@@ -47,8 +47,8 @@ class PrototypeBank:
         self.momentum = momentum
 
     @torch.no_grad()
-    def update(self, fused, labels):
-        features = F.normalize(fused.mean(1), dim=-1)
+    def update(self, tokens, labels):
+        features = F.normalize(tokens.mean(1), dim=-1)
         for cls in labels.unique().tolist():
             center = features[labels == cls].mean(0)
             if center.norm() <= 1e-6:
@@ -60,6 +60,12 @@ class PrototypeBank:
             old.copy_(F.normalize(center, dim=0))
 
 
+def cross_modal_centers(banks):
+    radar, optical = (banks[m].centers for m in MODALITIES)
+    shared = (radar.norm(dim=1) > 1e-6) & (optical.norm(dim=1) > 1e-6)
+    return ((radar + optical) / 2).masked_fill(~shared[:, None], 0)
+
+
 def prototype_loss(tokens, labels, centers, temperature):
     if centers is None:
         return tokens.new_zeros(())
@@ -67,7 +73,7 @@ def prototype_loss(tokens, labels, centers, temperature):
     valid = active[labels]
     if active.sum() < 2 or not valid.any():
         return tokens.new_zeros(())
-    logits = F.normalize(tokens.mean(1)[valid], dim=-1) @ centers.T / temperature
+    logits = F.normalize(tokens.mean(1)[valid], dim=-1) @ F.normalize(centers, dim=1).T / temperature
     return F.cross_entropy(logits.masked_fill(~active, float("-inf")), labels[valid])
 
 
@@ -162,10 +168,10 @@ def update_cache(cache, samples, limit):
     prune(cache, limit)
 
 
-def transaction(sat, row, bank, config, aggregate, sync, samples, matched_batches):
+def transaction(sat, row, centers, config, aggregate, sync, samples, matched_batches):
     training, link = config["training"], config["link"]
     size = sum(nbytes(t) for state in sat.states for t in state.values()) + link["protocol_overhead_bytes"]
-    proto = nbytes(bank.centers) if bank else 0
+    proto = nbytes(centers) if centers is not None else 0
     # Include one 64-bit sample ID per uploaded feature.
     up = 0 if sync else size + sum(nbytes(x) + nbytes(y) + 8 for x, y in samples.values())
     down = size + proto
@@ -227,7 +233,13 @@ def run(config, train, test, windows, out):
     workers = [r, o, PatchClassifier(dim, classes).to(device), PatchClassifier(dim, classes).to(device)]
     ground = PatchClassifier(dim, classes).to(device)
     opt = torch.optim.AdamW([*cross.parameters(), *ground.parameters()], lr=t["server_learning_rate"])
-    bank = PrototypeBank(classes, dim, device, t["prototype_momentum"]) if t["prototype_learning_enabled"] else None
+    warmup_rounds = t.get("prototype_warmup_aggregations", 1)
+    if type(warmup_rounds) is not int or warmup_rounds < 0:
+        raise ValueError("prototype_warmup_aggregations must be a nonnegative integer")
+    banks = {
+        m: PrototypeBank(classes, dim, device, t["prototype_momentum"]) for m in MODALITIES
+    } if t["prototype_learning_enabled"] else {}
+    centers = cross_modal_centers(banks) if banks else None
     global_states = snapshot(workers)
     by_modality = {m: [workers[i], workers[i + 2]] for i, m in enumerate(MODALITIES)}
     global_models = {m: [global_states[i], global_states[i + 2]] for i, m in enumerate(MODALITIES)}
@@ -247,6 +259,8 @@ def run(config, train, test, windows, out):
     received = {key: {} for key in satellites}
     available = 0.0
     for row in sorted(windows, key=lambda r: (r["start_offset_s"], r["plane"], r["slot"])):
+        # Switch only at a transaction boundary, once both modalities are warmed up.
+        stage_two = bool(banks) and min(versions.values()) >= warmup_rounds
         plane = row["plane"]
         modality = MODALITIES[row["slot"] - 1]
         other = MODALITIES[1 - MODALITIES.index(modality)]
@@ -259,7 +273,7 @@ def run(config, train, test, windows, out):
         matched_batches = (len(matched) + t["batch_size"] - 1) // t["batch_size"]
         aggregate = len(pending[modality].keys() | {plane}) >= t["aggregation_k"] and not sync
         duration, up, down, proto_bytes = transaction(
-            sat, row, bank, config, aggregate, sync, samples, matched_batches,
+            sat, row, centers if stage_two else None, config, aggregate, sync, samples, matched_batches,
         )
         start = max(available, row["start_offset_s"])
         finish = start + duration
@@ -287,9 +301,14 @@ def run(config, train, test, windows, out):
                     loss = F.cross_entropy(ground(fused), labels)
                     loss.backward()
                     opt.step()
-                    if bank:
-                        bank.update(fused, labels)
                     losses.append(loss.item())
+                if stage_two:
+                    # Count fresh uploads once, even if the peer has not passed yet.
+                    entries = list(samples.values())
+                    for group in range(0, len(entries), t["batch_size"]):
+                        tokens, labels = map(torch.stack, zip(*entries[group:group + t["batch_size"]]))
+                        banks[modality].update(tokens.to(device), labels.to(device))
+                    centers = cross_modal_centers(banks)
                 update_cache(own_cache, samples, cache_limit)
                 if not matched:
                     status = "uploaded_waiting_for_peer"
@@ -307,7 +326,7 @@ def run(config, train, test, windows, out):
                           f"test_accuracy={accuracy:.4f} test_miou={miou:.4f}", flush=True)
             sat.states = global_models[modality]
             sat.version = versions[modality]
-            sat.prototypes = bank.centers.detach().cpu().clone() if bank else None
+            sat.prototypes = centers.detach().cpu().clone() if stage_two else None
             sat.packets.clear()
             available = finish
         sat.clock = max(sat.clock, row["end_offset_s"])
@@ -315,6 +334,7 @@ def run(config, train, test, windows, out):
         contact_log.append({
             "plane": plane, "contact_start_s": row["start_offset_s"], "contact_end_s": row["end_offset_s"],
             "satellite_id": row["satellite_id"], "modality": modality,
+            "training_phase": 2 if stage_two else 1,
             "status": status, "transaction_finish_s": finish if sent else "",
             "radar_upload_bytes": up if sent and modality == "radar" else 0,
             "optical_upload_bytes": up if sent and modality == "optical" else 0,
@@ -347,7 +367,9 @@ def run(config, train, test, windows, out):
         "global_states": {f"{m}_{name}": state for m in MODALITIES
                           for name, state in zip(("encoder", "head"), global_models[m])},
         "cross_encoder_state": snapshot([cross])[0], "ground_head_state": snapshot([ground])[0],
-        "prototype_bank": bank.centers.cpu() if bank else None, "config": config,
+        "prototype_bank": centers.cpu() if centers is not None else None,
+        "modality_prototype_banks": {m: bank.centers.cpu() for m, bank in banks.items()},
+        "config": config,
     }, out / "checkpoint.pt")
     print(json.dumps(summary, indent=2))
 
