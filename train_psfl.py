@@ -252,8 +252,11 @@ def run(config, train, test, windows, out):
     by_modality = {m: [workers[i], workers[i + 2]] for i, m in enumerate(MODALITIES)}
     global_models = {m: [global_states[i], global_states[i + 2]] for i, m in enumerate(MODALITIES)}
     planes = list(range(1, config["constellation"]["planes"] + 1))
-    if not windows or not 1 <= t["aggregation_k"] <= len(planes):
-        raise ValueError("Need contact windows and a valid aggregation_k")
+    aggregation_k = t["aggregation_k"]
+    if not windows:
+        raise ValueError("Need contact windows")
+    if type(aggregation_k) is not int or aggregation_k < 1:
+        raise ValueError("aggregation_k must be a positive integer")
     dataset_cfg = config.get("dataset", {})
     train_ids = sample_indices(train, dataset_cfg.get("train_samples"), t["seed"], "train")
     test_ids = sample_indices(test, dataset_cfg.get("test_samples"), t["seed"] + 1, "test")
@@ -269,7 +272,7 @@ def run(config, train, test, windows, out):
         torch.utils.data.Subset(test, test_ids.tolist()), batch_size=t["batch_size"]
     )
     local_log, contact_log = [], []
-    pending = {m: {} for m in MODALITIES}
+    pending = {m: [] for m in MODALITIES}
     versions = dict.fromkeys(MODALITIES, 0)
     received = {key: {} for key in satellites}
     available = 0.0
@@ -286,7 +289,7 @@ def run(config, train, test, windows, out):
         samples = latest_samples(sat.packets) if not sync else {}
         matched = [sample_id for sample_id in samples if sample_id in peer_cache]
         matched_batches = (len(matched) + t["batch_size"] - 1) // t["batch_size"]
-        aggregate = len(pending[modality].keys() | {plane}) >= t["aggregation_k"] and not sync
+        aggregate = not sync and bool(samples) and len(pending[modality]) + 1 >= aggregation_k
         duration, up, down, proto_bytes = transaction(
             sat, row, centers if stage_two else None, config, aggregate, sync, samples, matched_batches,
         )
@@ -327,9 +330,10 @@ def run(config, train, test, windows, out):
                 update_cache(own_cache, samples, cache_limit)
                 if not matched:
                     status = "uploaded_waiting_for_peer"
-                pending[modality][plane] = sat.states
+                # Each successful upload contributes a separate model snapshot.
+                pending[modality].append(sat.states)
                 if aggregate:
-                    global_models[modality] = average(pending[modality].values())
+                    global_models[modality] = average(pending[modality])
                     pending[modality].clear()
                     versions[modality] += 1
                     for m in MODALITIES:
