@@ -29,7 +29,7 @@
   },
   "dataset": {
     "patch_size": 9,
-    "root_dir": "datasets/Houston2013"
+    "root_dir": "~/data/Houston2013"
   },
   "croma": {
     "patch_size": 1,
