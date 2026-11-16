@@ -9,6 +9,7 @@ python train_psfl.py
 
 默认使用 Houston2013 的 TRLabel / TSLabel 构造训练集和测试集。HSI 接光学分支，LiDAR 接雷达分支。训练样本以固定随机种子均分给各轨道面，同一对卫星使用相同的样本索引。
 
+- `dataset.train_samples` 和 `dataset.test_samples` 默认分别为 400 和 1000，各自在原始训练集和测试集内按种子无放回抽样。设为 `null` 使用对应的完整数据集。整个训练过程使用同一个测试子集。
 - `dataset.patch_size` 为数据裁剪边长，必须为正奇数；`croma.patch_size` 是 ViT 图像块边长，必须整除前者。默认 9×9 patch 产生 81 个 token。
 - 每个样本只有一个从 0 开始的中心像素类别。星上辅助头和地面分类头均使用 token mean pooling → Conv1d → GELU → Linear。
 - 每颗卫星只在自己的直连窗口内上传、下载。窗口重叠时，单链路地面站按窗口开始时间依次安排事务；事务必须在各自的窗口截止前完成。

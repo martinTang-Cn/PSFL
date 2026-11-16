@@ -29,6 +29,8 @@
   },
   "dataset": {
     "patch_size": 9,
+    "train_samples": 400,
+    "test_samples": 1000,
     "root_dir": "~/data/Houston2013"
   },
   "croma": {

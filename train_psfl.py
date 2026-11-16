@@ -210,6 +210,14 @@ def write_csv(path, rows):
             writer.writerows(rows)
 
 
+def sample_indices(dataset, count, seed, split):
+    if count is None:
+        return torch.arange(len(dataset))
+    if type(count) is not int or not 1 <= count <= len(dataset):
+        raise ValueError(f"dataset.{split}_samples must be null or an integer in [1, {len(dataset)}]")
+    return torch.randperm(len(dataset), generator=torch.Generator().manual_seed(seed))[:count]
+
+
 def run(config, train, test, windows, out):
     t = config["training"]
     torch.manual_seed(t["seed"])
@@ -246,13 +254,20 @@ def run(config, train, test, windows, out):
     planes = list(range(1, config["constellation"]["planes"] + 1))
     if not windows or not 1 <= t["aggregation_k"] <= len(planes):
         raise ValueError("Need contact windows and a valid aggregation_k")
-    partitions = torch.randperm(len(train), generator=torch.Generator().manual_seed(t["seed"])).tensor_split(len(planes))
+    dataset_cfg = config.get("dataset", {})
+    train_ids = sample_indices(train, dataset_cfg.get("train_samples"), t["seed"], "train")
+    test_ids = sample_indices(test, dataset_cfg.get("test_samples"), t["seed"] + 1, "test")
+    if dataset_cfg.get("train_samples") is None:
+        train_ids = torch.randperm(len(train), generator=torch.Generator().manual_seed(t["seed"]))
+    partitions = train_ids.tensor_split(len(planes))
     satellites = {
         (plane, m): Satellite(global_models[m], batches(train, ids, t["batch_size"], t["epochs"], t["seed"] + plane, m))
         for plane, ids in zip(planes, partitions)
         for m in MODALITIES
     }
-    loader = torch.utils.data.DataLoader(test, batch_size=t["batch_size"])
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(test, test_ids.tolist()), batch_size=t["batch_size"]
+    )
     local_log, contact_log = [], []
     pending = {m: {} for m in MODALITIES}
     versions = dict.fromkeys(MODALITIES, 0)
@@ -360,7 +375,7 @@ def run(config, train, test, windows, out):
     summary = {"test_accuracy": accuracy, "test_miou": miou, "aggregations": sum(versions.values()),
                "aggregations_by_modality": versions,
                "server_updates": sum(row["server_updates"] for row in contact_log),
-               "train_samples": len(train), "test_samples": len(test),
+               "train_samples": len(train_ids), "test_samples": len(test_ids),
                "samples_per_plane": {p: len(ids) for p, ids in zip(planes, partitions)}}
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     torch.save({
